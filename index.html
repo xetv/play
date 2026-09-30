@@ -2053,6 +2053,7 @@
 
   function cleanupHls(){
     if(state.ckEme){ try{ state.ckEme.remove(); }catch(e){} state.ckEme = null; }
+    if(state.dashRefresh){ try{ clearInterval(state.dashRefresh); }catch(e){} state.dashRefresh = null; }
     if(state.hls){
       try{ state.hls.destroy(); }catch(e){}
       state.hls = null;
@@ -2670,6 +2671,46 @@
         try{ console.warn('[DASH] error:', e && e.error ? (e.error.message || e.error) : e); }catch(_){}
         fail();
       });
+      // ---- DIAGNOSA + JARING PENGAMAN LIVE (manifest tidak ter-refresh) ----
+      var fragN = 0, mpdN = 0, dashT0 = Date.now();
+      function dt(){ return '+' + ((Date.now() - dashT0) / 1000).toFixed(1) + 's'; }
+      try{
+        player.on(dashjs.MediaPlayer.events.MANIFEST_LOADED, function(e){
+          mpdN++;
+          try{
+            var d = e && e.data ? e.data : {};
+            console.log('[MPD] ' + dt() + ' dimuat #' + mpdN, 'type=' + d.type, 'minUpdate=' + d.minimumUpdatePeriod,
+              'timeShift=' + d.timeShiftBufferDepth, 'ast=' + d.availabilityStartTime,
+              'suggDelay=' + d.suggestedPresentationDelay, 'utc=' + (d.UTCTiming ? JSON.stringify(d.UTCTiming) : 'tidak ada'));
+          }catch(_){}
+        });
+        player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_COMPLETED, function(e){
+          if(fragN++ >= 60) return;
+          try{
+            var r = e && e.request ? e.request : {};
+            console.log('[Frag] ' + dt(), r.mediaType, 'idx=' + r.index, 'start=' + (r.startTime !== undefined ? Number(r.startTime).toFixed(1) : '?'), 'dur=' + (r.duration !== undefined ? Number(r.duration).toFixed(1) : '?'));
+          }catch(_){}
+        });
+        player.on(dashjs.MediaPlayer.events.PLAYBACK_STALLED, function(){ try{ console.warn('[DASH] ' + dt() + ' PLAYBACK_STALLED'); }catch(_){} });
+      }catch(eDiag){}
+      // Streaming live: kalau buffer depan menipis, paksa muat ulang manifest
+      // supaya dash.js tahu segmen terbaru (jaring pengaman kalau refresh
+      // otomatisnya tidak jalan).
+      if(state.dashRefresh){ try{ clearInterval(state.dashRefresh); }catch(_){} }
+      state.dashRefresh = setInterval(function(){
+        try{
+          if(isStale(token) || state.dash !== player){ clearInterval(state.dashRefresh); state.dashRefresh = null; return; }
+          if(typeof player.isDynamic === 'function' && !player.isDynamic()) return;
+          var vb = Number(player.getBufferLength('video'));
+          if(!isFinite(vb) || vb < 6){
+            if(typeof player.refreshManifest === 'function'){
+              try{ console.log('[MPD] ' + dt() + ' refresh manual (buffer video=' + (isFinite(vb) ? vb.toFixed(1) : '?') + 's)'); }catch(_){}
+              player.refreshManifest();
+            }
+          }
+        }catch(_){}
+      }, 2000);
+
       player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, function(){
         applyForcedQualityDash(player, ch);
       });
