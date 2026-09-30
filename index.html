@@ -2553,7 +2553,6 @@
           }catch(e4){}
           attachClearKeyEme(ckMap, firstKey);
           try{ console.info('[DRM] ClearKey (EME langsung) aktif. KID dimiliki:', Object.keys(ckMap)); }catch(e){}
-          try{ console.info('[DRM] ClearKey lokal aktif, jumlah kunci:', count, Object.keys(ckMap)); }catch(e){}
         } else {
           try{ console.warn('[DRM] license_key clearkey tidak valid (harus KID:KEY heksadesimal 32 karakter):', ch.drmLicenseUrl); }catch(e){}
         }
@@ -2803,21 +2802,34 @@
       state.retryDelay = 0;
       hideToast();
       els.loadingOverlay.hidden = true;
-      try{
-        els.video.muted = false;
-      }catch(e){}
-      setTimeout(function(){
+      // PERBAIKAN FREEZE: Chrome/Brave/Edge MEM-PAUSE video (bukan sekadar
+      // menolak unmute) kalau kode mencoba unmute sebelum pengguna pernah
+      // berinteraksi dengan halaman ("Unmuting failed and the element was
+      // paused instead..."). Pada stream DRM, play() baru selesai setelah
+      // beberapa detik, jadi video tampil lalu tiba-tiba berhenti.
+      // Sekarang: jangan unmute otomatis kalau belum ada interaksi; dan kalau
+      // browser tetap mem-pause gara-gara unmute, langsung lanjutkan
+      // dalam keadaan bisu + tampilkan badge "ketuk untuk suara".
+      var canUnmute = !(navigator.userActivation && !navigator.userActivation.hasBeenActive);
+      if(!canUnmute){
+        els.video.muted = true;
+        showMutedBadge();
+        return;
+      }
+      var guard = function(){
         if(isStale(token)) return;
-        if(els.video.muted){
-          els.video.muted = false; // percobaan kedua, sebagian browser butuh sedikit jeda
-          setTimeout(function(){
-            if(isStale(token)) return;
-            if(els.video.muted) showMutedBadge(); else hideMutedBadge();
-          }, 200);
-        } else {
-          hideMutedBadge();
-        }
-      }, 150);
+        els.video.muted = true;
+        var pp = els.video.play();
+        if(pp && pp.catch) pp.catch(function(){});
+        showMutedBadge();
+      };
+      els.video.addEventListener('pause', guard, { once: true });
+      try{ els.video.muted = false; }catch(e){}
+      setTimeout(function(){
+        els.video.removeEventListener('pause', guard);
+        if(isStale(token)) return;
+        if(els.video.muted) showMutedBadge(); else hideMutedBadge();
+      }, 800);
     }
     function onPlayError(err){
       if(isStale(token)) return;
