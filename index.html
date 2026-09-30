@@ -2052,6 +2052,7 @@
   /* ---------------- Playback ---------------- */
 
   function cleanupHls(){
+    if(state.ckEme){ try{ state.ckEme.remove(); }catch(e){} state.ckEme = null; }
     if(state.hls){
       try{ state.hls.destroy(); }catch(e){}
       state.hls = null;
@@ -2371,6 +2372,87 @@
     }catch(e){ return null; }
   }
 
+
+  // ClearKey via EME langsung (tanpa modul DRM dash.js). Menjawab permintaan
+  // lisensi dari CDM ClearKey browser dengan kunci dari playlist. Kalau KID
+  // yang diminta stream tidak ada di playlist, dipakai kunci pertama sebagai
+  // cadangan, dan KID yang diminta dicatat di console untuk diagnosa.
+  function b64uToBytes(b64u){
+    var b = b64u.replace(/-/g,'+').replace(/_/g,'/');
+    while(b.length % 4) b += '=';
+    var bin = atob(b), out = new Uint8Array(bin.length);
+    for(var i=0;i<bin.length;i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function bytesToB64u(bytes){
+    var bin = '';
+    for(var i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  }
+  function attachClearKeyEme(keyMap, firstKey){
+    var video = els.video;
+    var seen = {};
+    var sessions = [];
+    var mkPromise = null;
+    function ensureKeys(){
+      if(mkPromise) return mkPromise;
+      var vcaps = ['avc1.42E01E','avc1.4D401F','avc1.640028','hvc1.1.6.L93.B0','hev1.1.6.L93.B0','vp09.00.10.08','av01.0.05M.08'].map(function(c){ return { contentType: 'video/mp4; codecs="' + c + '"' }; });
+      var acaps = ['mp4a.40.2','mp4a.40.5','ec-3','ac-3','opus'].map(function(c){ return { contentType: 'audio/mp4; codecs="' + c + '"' }; });
+      var cfg = [{
+        initDataTypes: ['cenc','keyids','webm'],
+        videoCapabilities: vcaps,
+        audioCapabilities: acaps,
+        persistentState: 'optional',
+        distinctiveIdentifier: 'optional',
+        sessionTypes: ['temporary']
+      }];
+      mkPromise = navigator.requestMediaKeySystemAccess('org.w3.clearkey', cfg)
+        .then(function(acc){ return acc.createMediaKeys(); })
+        .then(function(mk){ return video.setMediaKeys(mk).then(function(){ return mk; }); });
+      return mkPromise;
+    }
+    function makeSession(mk, type, data){
+      var sess = mk.createSession('temporary');
+      sessions.push(sess);
+      sess.addEventListener('message', function(ev){
+        var kids = [];
+        try{ kids = JSON.parse(new TextDecoder().decode(ev.message)).kids || []; }catch(e){}
+        var missing = kids.filter(function(k){ return !keyMap[k]; });
+        try{ console.info('[ClearKey] KID diminta stream:', kids, missing.length ? '-> TIDAK COCOK dengan playlist, pakai kunci cadangan' : '-> cocok'); }catch(e){}
+        var keys = kids.map(function(k){ return { kty: 'oct', kid: k, k: keyMap[k] || firstKey }; });
+        var lic = JSON.stringify({ keys: keys, type: 'temporary' });
+        sess.update(new TextEncoder().encode(lic)).catch(function(err){
+          try{ console.warn('[ClearKey] update gagal:', err && err.message); }catch(e){}
+        });
+      });
+      return sess.generateRequest(type, data);
+    }
+    function onEncrypted(ev){
+      var id = ev.initDataType + ':' + (ev.initData ? bytesToB64u(new Uint8Array(ev.initData)) : '');
+      if(seen[id]) return;
+      seen[id] = true;
+      ensureKeys().then(function(mk){
+        return makeSession(mk, ev.initDataType, ev.initData).catch(function(err){
+          // initData (mis. PSSH Widevine) tidak dikenali CDM ClearKey ->
+          // minta lewat daftar KID milik playlist saja.
+          try{ console.info('[ClearKey] initData ' + ev.initDataType + ' ditolak, pakai keyids playlist'); }catch(e){}
+          var body = JSON.stringify({ kids: Object.keys(keyMap) });
+          return makeSession(mk, 'keyids', new TextEncoder().encode(body));
+        });
+      }).catch(function(err){
+        try{ console.error('[ClearKey] EME gagal:', err && err.message ? err.message : err); }catch(e){}
+      });
+    }
+    video.addEventListener('encrypted', onEncrypted);
+    state.ckEme = {
+      remove: function(){
+        try{ video.removeEventListener('encrypted', onEncrypted); }catch(e){}
+        sessions.forEach(function(s){ try{ s.close(); }catch(e){} });
+        try{ var pr = video.setMediaKeys(null); if(pr && pr.catch) pr.catch(function(){}); }catch(e){}
+      }
+    };
+  }
+
   function tryDash(url, token, ch, onFail){
     if(isStale(token)) return;
     if(!window.dashjs){
@@ -2443,31 +2525,13 @@
           }
         });
         if(count > 0){
-          var finalMap = ckMap;
-          try{
-            if(typeof Proxy === 'function'){
-              finalMap = new Proxy(ckMap, {
-                get: function(t, prop){
-                  if(prop === 'hasOwnProperty') return function(k){ return true; };
-                  if(typeof prop === 'string' && prop in t) return t[prop];
-                  if(typeof prop === 'string' && prop !== 'toJSON' && prop !== 'then') return firstKey;
-                  return t[prop];
-                },
-                has: function(){ return true; }
-              });
-            }
-          }catch(e){ finalMap = ckMap; }
-          // priority 0 = dipilih paling awal; sistem DRM lain (Widevine/PlayReady)
-          // diberi prioritas rendah supaya tidak dipilih dash.js.
-          var clearProt = { 'org.w3.clearkey': { clearkeys: finalMap, priority: 0 } };
-          clearProt['com.widevine.alpha'] = { priority: 8 };
-          clearProt['com.microsoft.playready'] = { priority: 9 };
-          player.setProtectionData(clearProt);
-          // JAMINAN: banyak manifest multi-DRM memuat ContentProtection untuk
-          // Widevine + PlayReady + ClearKey. dash.js bisa memilih Widevine/
-          // PlayReady (tanpa server lisensi -> "No license server URL
-          // specified"). Jadi manifest ditulis ulang sebelum diproses: buang
-          // Widevine/PlayReady, dan sisakan/tambahkan ClearKey.
+          // CARA BARU: ClearKey ditangani langsung lewat EME browser
+          // (navigator.requestMediaKeySystemAccess), BUKAN lewat modul DRM
+          // dash.js. Modul DRM dash.js menelan error internalnya lalu
+          // menampilkan pesan menyesatkan "No license server URL specified".
+          // Agar dash.js tidak ikut campur, semua <ContentProtection> dibuang
+          // dari manifest dan event 'encrypted' diabaikan olehnya.
+          try{ player.updateSettings({ streaming: { protection: { ignoreEmeEncryptedEvent: true } } }); }catch(e){}
           try{
             if(typeof player.addResponseInterceptor === 'function'){
               player.addResponseInterceptor(function(resp){
@@ -2478,26 +2542,17 @@
                       try{ txt = new TextDecoder('utf-8').decode(txt); }catch(e2){ txt = null; }
                     }
                     if(typeof txt === 'string' && txt.indexOf('ContentProtection') !== -1){
-                      var CK = 'e2719d58-a985-b3c9-781a-b030af78d30e';
-                      var CK2 = '1077efec-c0b2-4d02-ace3-3c1e52e2fb4b';
-                      var re = /<ContentProtection\b[^>]*?\/>|<ContentProtection\b[^>]*>[\s\S]*?<\/ContentProtection>/gi;
-                      var hasCk = txt.toLowerCase().indexOf(CK) !== -1 || txt.toLowerCase().indexOf(CK2) !== -1;
-                      txt = txt.replace(re, function(m){
-                        var l = m.toLowerCase();
-                        if(l.indexOf('mp4protection') !== -1){
-                          return hasCk ? m : m + '<ContentProtection schemeIdUri="urn:uuid:' + CK + '" value="ClearKey1.0"/>';
-                        }
-                        if(l.indexOf(CK) !== -1 || l.indexOf(CK2) !== -1) return m;
-                        return ''; // Widevine, PlayReady, dll dibuang
-                      });
+                      txt = txt.replace(/<ContentProtection\b[^>]*?\/>|<ContentProtection\b[^>]*>[\s\S]*?<\/ContentProtection>/gi, '');
                       resp.data = txt;
                     }
                   }
-                }catch(e3){ /* biarkan manifest asli */ }
+                }catch(e3){}
                 return Promise.resolve(resp);
               });
             }
           }catch(e4){}
+          attachClearKeyEme(ckMap, firstKey);
+          try{ console.info('[DRM] ClearKey (EME langsung) aktif. KID dimiliki:', Object.keys(ckMap)); }catch(e){}
           try{ console.info('[DRM] ClearKey lokal aktif, jumlah kunci:', count, Object.keys(ckMap)); }catch(e){}
         } else {
           try{ console.warn('[DRM] license_key clearkey tidak valid (harus KID:KEY heksadesimal 32 karakter):', ch.drmLicenseUrl); }catch(e){}
