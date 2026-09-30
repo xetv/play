@@ -2427,26 +2427,78 @@
       });
       return sess.generateRequest(type, data);
     }
+    // Baca KID ASLI yang dipakai stream dari initData: PSSH box (v1 punya
+    // daftar KID; v0 Widevine berisi protobuf dengan field key_id) atau JSON keyids.
+    function toHex(u8){ var h=''; for(var i=0;i<u8.length;i++) h += ('0'+u8[i].toString(16)).slice(-2); return h; }
+    function parseInitDataKids(type, buf){
+      var kids = [];
+      try{
+        var u = new Uint8Array(buf);
+        if(type === 'keyids'){
+          var j = JSON.parse(new TextDecoder().decode(u));
+          (j.kids || []).forEach(function(k){ kids.push(b64uToBytes(k)); });
+          return kids;
+        }
+        var dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
+        var off = 0;
+        while(off + 32 <= u.length){
+          var size = dv.getUint32(off);
+          if(size < 32 || off + size > u.length) break;
+          var box = String.fromCharCode(u[off+4],u[off+5],u[off+6],u[off+7]);
+          if(box === 'pssh'){
+            var ver = u[off+8];
+            var q = off + 12 + 16;
+            if(ver >= 1){
+              var n = dv.getUint32(q); q += 4;
+              for(var i=0;i<n && q+16<=off+size;i++){ kids.push(u.slice(q, q+16)); q += 16; }
+            }
+            if(!kids.length){
+              var dsz = dv.getUint32(q); q += 4;
+              var end = Math.min(q + dsz, off + size);
+              while(q < end){
+                var tag = u[q++], wt = tag & 7, fld = tag >> 3;
+                if(wt === 2){
+                  var len = 0, sh = 0, bb;
+                  do{ bb = u[q++]; len |= (bb & 0x7f) << sh; sh += 7; }while(bb & 0x80);
+                  if(fld === 2 && len === 16) kids.push(u.slice(q, q+16));
+                  q += len;
+                } else if(wt === 0){ while(u[q++] & 0x80){} }
+                else break;
+              }
+            }
+          }
+          off += size;
+        }
+      }catch(e){}
+      return kids;
+    }
     function onEncrypted(ev){
       var id = ev.initDataType + ':' + (ev.initData ? bytesToB64u(new Uint8Array(ev.initData)) : '');
       if(seen[id]) return;
       seen[id] = true;
+      var realKids = parseInitDataKids(ev.initDataType, ev.initData).map(bytesToB64u);
+      try{ console.info('[ClearKey] KID asli stream (dari initData):', realKids.map(function(k){ return toHex(b64uToBytes(k)); }), '| KID playlist:', Object.keys(keyMap).map(function(k){ return toHex(b64uToBytes(k)); })); }catch(e){}
       ensureKeys().then(function(mk){
+        if(realKids.length){
+          // Minta langsung untuk KID asli stream (semua KID di initData).
+          return makeSession(mk, 'keyids', new TextEncoder().encode(JSON.stringify({ kids: realKids })));
+        }
         return makeSession(mk, ev.initDataType, ev.initData).catch(function(err){
-          // initData (mis. PSSH Widevine) tidak dikenali CDM ClearKey ->
-          // minta lewat daftar KID milik playlist saja.
           try{ console.info('[ClearKey] initData ' + ev.initDataType + ' ditolak, pakai keyids playlist'); }catch(e){}
-          var body = JSON.stringify({ kids: Object.keys(keyMap) });
-          return makeSession(mk, 'keyids', new TextEncoder().encode(body));
+          return makeSession(mk, 'keyids', new TextEncoder().encode(JSON.stringify({ kids: Object.keys(keyMap) })));
         });
       }).catch(function(err){
         try{ console.error('[ClearKey] EME gagal:', err && err.message ? err.message : err); }catch(e){}
       });
     }
+    function onWaitingForKey(){
+      try{ console.warn('[ClearKey] video menunggu kunci (waitingforkey) — kemungkinan ada KID/rotasi kunci yang belum terjawab'); }catch(e){}
+    }
+    video.addEventListener('waitingforkey', onWaitingForKey);
     video.addEventListener('encrypted', onEncrypted);
     state.ckEme = {
       remove: function(){
-        try{ video.removeEventListener('encrypted', onEncrypted); }catch(e){}
+        try{ video.removeEventListener('encrypted', onEncrypted); video.removeEventListener('waitingforkey', onWaitingForKey); }catch(e){}
         sessions.forEach(function(s){ try{ s.close(); }catch(e){} });
         try{ var pr = video.setMediaKeys(null); if(pr && pr.catch) pr.catch(function(){}); }catch(e){}
       }
