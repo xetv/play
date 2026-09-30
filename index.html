@@ -838,6 +838,7 @@
     channels: [],
     currentIndex: 0,
     epgIndex: null,
+    epgAlias: null,
     epgToken: 0,
     numberBuffer: '',
     numberTimer: null,
@@ -1689,56 +1690,144 @@
     return { index: index, count: count };
   }
 
-  async function fetchEpgText(url){
-    var res = await fetch(url, { cache: 'no-store' });
+  // ---- EPG v2 ----
+  // Perbaikan dibanding versi lama (yang cuma memakai SATU sumber EPG):
+  //  1) Semua sumber EPG di playlist dicoba berurutan (maks. EPG_MAX_SOURCES)
+  //     dan hasilnya DIGABUNG: channel yang belum punya jadwal dari sumber
+  //     pertama dilengkapi dari sumber berikutnya. Berhenti lebih awal kalau
+  //     semua channel sudah terlayani.
+  //  2) Channel TANPA tvg-id (atau tvg-id-nya tak ada di EPG) dicocokkan lewat
+  //     NAMA channel <-> <display-name> di XMLTV. EPG tidak membedakan
+  //     stream DRM/non-DRM sama sekali; yang menentukan hanya id/nama.
+  //  3) Sumber yang diblokir CORS dicoba lagi lewat proxy (kalau proxy global
+  //     diisi). Format gzip dikenali dari isinya, bukan dari ekstensi URL.
+  var EPG_MAX_SOURCES = 8;
+  var EPG_MAX_BYTES = 30 * 1000 * 1000; // lewati file EPG yang terlalu besar
+
+  async function fetchEpgText(url, fetchUrl){
+    var res = await fetch(fetchUrl || url, { cache: 'no-store' });
     if(!res.ok) throw new Error('HTTP ' + res.status);
-    if(/\.gz(\?|$)/i.test(url) && window.DecompressionStream){
-      var stream = res.body.pipeThrough(new DecompressionStream('gzip'));
-      return await new Response(stream).text();
+    var len = parseInt(res.headers.get('content-length') || '0', 10);
+    if(len > EPG_MAX_BYTES) throw new Error('EPG terlalu besar');
+    var buf = await res.arrayBuffer();
+    var u8 = new Uint8Array(buf);
+    if(u8.length > 2 && u8[0] === 0x1f && u8[1] === 0x8b){
+      if(!window.DecompressionStream) throw new Error('gzip tidak didukung browser ini');
+      var st = new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'));
+      return await new Response(st).text();
     }
-    return await res.text();
+    return new TextDecoder('utf-8').decode(u8);
+  }
+
+  // Langsung dulu; kalau gagal (CORS/jaringan) dan ada proxy global, lewat proxy.
+  async function fetchEpgTextSmart(url){
+    try{
+      return await fetchEpgText(url);
+    }catch(e1){
+      var base = '';
+      try{ base = getProxyBase(null); }catch(e){}
+      if(!base) throw e1;
+      return await fetchEpgText(url, buildProxiedUrlFor(url, {}, base));
+    }
+  }
+
+  // Normalisasi nama channel untuk pencocokan: buang (V+), [HD], aksen,
+  // spasi/tanda baca, dan akhiran kualitas (HD/SD/4K).
+  function epgNorm(n){
+    var s = String(n || '');
+    try{ s = s.normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); }catch(e){}
+    s = s.toLowerCase().replace(/[\(\[\{][^\)\]\}]*[\)\]\}]/g, ' ');
+    s = s.replace(/[^a-z0-9]+/g, ' ').trim();
+    var prev;
+    do{ prev = s; s = s.replace(/\s+(hd|sd|fhd|uhd|4k|hevc)$/, ''); }while(s !== prev);
+    return s.replace(/\s+/g, '');
+  }
+
+  // <channel id="..."><display-name>..</display-name></channel> -> { namaTernormalisasi: id }
+  function parseXmltvChannelNames(xmlText){
+    var map = {};
+    var re = /<channel\b[^>]*?\bid="([^"]*)"[^>]*>([\s\S]*?)<\/channel>/gi;
+    var m;
+    while((m = re.exec(xmlText))){
+      var id = m[1];
+      var dre = /<display-name[^>]*>([\s\S]*?)<\/display-name>/gi, d;
+      var names = [];
+      while((d = dre.exec(m[2]))) names.push(decodeXmlEntities(d[1].trim()));
+      // id seperti "RCTI.id" / "SCTV.id@SD" juga jadi kandidat nama
+      names.push(id.replace(/@.*$/, '').replace(/\.[a-z]{2,3}$/i, ''));
+      names.forEach(function(nm){
+        var k = epgNorm(nm);
+        if(k && !map[k]) map[k] = id;
+      });
+    }
+    return map;
+  }
+
+  function epgResolve(index, alias, ch){
+    if(!index || !ch) return '';
+    if(ch.tvgId && index[ch.tvgId]) return ch.tvgId;
+    var a = alias && alias[epgNorm(ch.name)];
+    return (a && index[a]) ? a : '';
   }
 
   // Token sesi khusus EPG: kalau playlist diganti sebelum fetch EPG lama
   // selesai, hasil basi diabaikan (pola sama seperti playToken untuk video).
   function loadEpg(epgUrls){
     state.epgIndex = null;
+    state.epgAlias = null;
     var myToken = ++state.epgToken;
     if(!epgUrls || epgUrls.length === 0) return;
+    if(!state.channels || state.channels.length === 0) return;
 
-    var wantedTvgIds = {};
-    var any = false;
-    state.channels.forEach(function(c){
-      if(c.tvgId){ wantedTvgIds[c.tvgId] = true; any = true; }
-    });
-    if(!any) return; // playlist tidak punya tvg-id sama sekali, EPG tidak akan pernah cocok
+    var wantedIds = {};
+    state.channels.forEach(function(c){ if(c.tvgId) wantedIds[c.tvgId] = true; });
 
-    var sources = epgUrls.slice(0, 4); // batasi maksimal 4 percobaan, tetap ringan
-    var i = 0;
-    function tryNext(){
+    var sources = epgUrls.slice(0, EPG_MAX_SOURCES);
+    var merged = {}, alias = {};
+    var i = 0, loaded = 0;
+
+    function allCovered(){
+      return state.channels.every(function(c){ return !!epgResolve(merged, alias, c); });
+    }
+    function publish(){
+      state.epgIndex = merged;
+      state.epgAlias = alias;
+      var cur = state.channels[state.currentIndex];
+      if(cur && els.osd.classList.contains('show')) refreshOsdEpg(cur);
+    }
+    function next(){
       if(i >= sources.length || myToken !== state.epgToken) return;
+      if(loaded > 0 && allCovered()) return;
       var url = sources[i++];
-      fetchEpgText(url).then(function(text){
+      fetchEpgTextSmart(url).then(function(text){
         if(myToken !== state.epgToken) return;
-        var result = parseXmltvProgrammes(text, wantedTvgIds);
+        var nameMap = parseXmltvChannelNames(text);
+        var want = {}, newAlias = {};
+        Object.keys(wantedIds).forEach(function(id){ if(!merged[id]) want[id] = true; });
+        state.channels.forEach(function(c){
+          if(epgResolve(merged, alias, c)) return; // sudah terlayani sumber sebelumnya
+          var k = epgNorm(c.name);
+          var id = k ? nameMap[k] : '';
+          if(id && !merged[id]){ want[id] = true; newAlias[k] = id; }
+        });
+        var result = parseXmltvProgrammes(text, want);
+        Object.keys(result.index).forEach(function(id){ merged[id] = result.index[id]; });
+        Object.keys(newAlias).forEach(function(k){ if(merged[newAlias[k]]) alias[k] = newAlias[k]; });
         if(result.count > 0){
-          state.epgIndex = result.index;
-          // Kalau OSD sedang tampil, refresh supaya info EPG langsung muncul.
-          var ch = state.channels[state.currentIndex];
-          if(ch && els.osd.classList.contains('show')) refreshOsdEpg(ch);
-        } else {
-          tryNext(); // tidak ada programme yang cocok, coba sumber berikutnya
+          loaded++;
+          publish(); // tampilkan secepatnya, lalu lengkapi dari sumber berikutnya
         }
+        next();
       }).catch(function(){
-        tryNext(); // sumber ini gagal (CORS/network/dll), coba sumber berikutnya
+        next(); // sumber ini gagal (CORS/network/dll), coba sumber berikutnya
       });
     }
-    tryNext();
+    next();
   }
 
-  function getNowPlaying(tvgId){
-    if(!state.epgIndex || !tvgId) return null;
-    var list = state.epgIndex[tvgId];
+  function getNowPlaying(epgId){
+    if(!state.epgIndex || !epgId) return null;
+    var list = state.epgIndex[epgId];
     if(!list || list.length === 0) return null;
     var now = new Date();
     for(var i=0;i<list.length;i++){
@@ -1748,7 +1837,8 @@
   }
 
   function refreshOsdEpg(ch){
-    var programme = ch && ch.tvgId ? getNowPlaying(ch.tvgId) : null;
+    var id = ch ? epgResolve(state.epgIndex, state.epgAlias, ch) : '';
+    var programme = id ? getNowPlaying(id) : null;
     if(programme){
       els.osdEpg.innerHTML = '<b>Sekarang:</b> ' + programme.title.replace(/</g,'&lt;');
       els.osdEpg.hidden = false;
