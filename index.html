@@ -2495,10 +2495,31 @@
       try{ console.warn('[ClearKey] video menunggu kunci (waitingforkey) — kemungkinan ada KID/rotasi kunci yang belum terjawab'); }catch(e){}
     }
     video.addEventListener('waitingforkey', onWaitingForKey);
+
+    // ---- DIAGNOSA (sementara): rekam kondisi pemutar tiap detik + tiap event ----
+    var diagN = 0, diagT0 = Date.now();
+    function snap(tag){
+      if(diagN++ > 80) return;
+      var v = video, b = '';
+      try{ var r = v.buffered; for(var i=0;i<r.length;i++) b += r.start(i).toFixed(1) + '-' + r.end(i).toFixed(1) + ' '; }catch(e){}
+      var ab = '?', vb = '?';
+      try{ if(state.dash){ ab = state.dash.getBufferLength('audio'); vb = state.dash.getBufferLength('video'); ab = (ab===undefined||ab===null)?'-':Number(ab).toFixed(1); vb = (vb===undefined||vb===null)?'-':Number(vb).toFixed(1); } }catch(e){}
+      try{
+        console.log('[Diag] +' + ((Date.now()-diagT0)/1000).toFixed(1) + 's ' + tag +
+          ' | ct=' + v.currentTime.toFixed(2) + ' paused=' + v.paused + ' muted=' + v.muted +
+          ' rs=' + v.readyState + ' ns=' + v.networkState + ' buf=[' + b.trim() + ']' +
+          ' audioBuf=' + ab + ' videoBuf=' + vb +
+          (v.error ? (' ERROR code=' + v.error.code + ' ' + (v.error.message || '')) : ''));
+      }catch(e){}
+    }
+    var diagEvents = ['playing','pause','waiting','stalled','seeking','seeked','emptied','ended','error','volumechange','suspend'];
+    var diagHandlers = diagEvents.map(function(n){ var h = function(){ snap('EVENT ' + n); }; video.addEventListener(n, h); return [n, h]; });
+    var diagTimer = setInterval(function(){ snap('tick'); }, 1000);
     video.addEventListener('encrypted', onEncrypted);
     state.ckEme = {
       remove: function(){
         try{ video.removeEventListener('encrypted', onEncrypted); video.removeEventListener('waitingforkey', onWaitingForKey); }catch(e){}
+        try{ clearInterval(diagTimer); diagHandlers.forEach(function(x){ video.removeEventListener(x[0], x[1]); }); }catch(e){}
         sessions.forEach(function(s){ try{ s.close(); }catch(e){} });
         try{ var pr = video.setMediaKeys(null); if(pr && pr.catch) pr.catch(function(){}); }catch(e){}
       }
