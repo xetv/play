@@ -721,7 +721,10 @@
   // ("cloudflare", "Cloudflare", "CLOUDFLARE" semuanya cocok).
   var PROXY_MAP = {
     deno: 'https://flat-dodo-1598.xetya77.deno.net',
-    cloudflare: 'https://tuner-header-proxy.nubuuys77.workers.dev'
+    cloudflare: 'https://tuner-header-proxy.nubuuys77.workers.dev',
+    // Proxy LOKAL (jalankan local-proxy.js di komputer/HP-mu). Memakai IP rumahmu,
+    // jadi cocok untuk channel yang memblokir IP Cloudflare/Deno (mis. Vision+).
+    local: 'http://localhost:8787'
   };
 
   // ============================================================
@@ -1009,6 +1012,64 @@
       }
     }
 
+    // ---- URL CADANGAN (baris di-comment "##http..." / "###http...") ----
+    // Baris komentar yang isinya URL stream dianggap sumber CADANGAN, BUKAN
+    // channel baru (jadi daftar channel, nomor, dan favorit tidak berubah).
+    // Aturan pemasangan:
+    //  1) Di dalam blok yang sama dengan URL aktif (EXTINF ... ###url ...
+    //     URL-aktif, atau ###url tepat SESUDAH URL aktif): jadi cadangan
+    //     channel itu, memakai header/DRM blok tersebut.
+    //  2) Blok "mati" (EXTINF + header/DRM + ###url, tanpa URL aktif): kalau
+    //     ada channel aktif dengan NAMA yang sama, dipasang sebagai cadangan
+    //     channel itu dengan header/DRM MILIKNYA SENDIRI. Kalau tidak ada
+    //     pasangan namanya, dijadikan channel sendiri (nama boleh kembar).
+    // Baris "##EXTINF..." (channel yang seluruhnya dinonaktifkan) tidak
+    // ikut, karena bukan cadangan dari channel manapun.
+    var backupRe = /^#{2,}\s*(https?:\/\/\S.*)$/i;
+    var MAX_BACKUPS = 6;
+    var lastChannel = null;
+    var orphans = [];
+    function metaOf(c){
+      return { referer:c.referer, userAgent:c.userAgent, origin:c.origin,
+               drmType:c.drmType, drmLicenseUrl:c.drmLicenseUrl,
+               proxyName:c.proxyName, quality:c.quality };
+    }
+    function srcKey(u, m){ return u + '|' + (m.drmType || '') + '|' + (m.drmLicenseUrl || ''); }
+    function addBackupTo(ch, url, meta){
+      if(!ch || !ch.url) return false;
+      var k = srcKey(url, meta);
+      if(srcKey(ch.url, metaOf(ch)) === k) return false;
+      ch.backups = ch.backups || [];
+      if(ch.backups.length >= MAX_BACKUPS) return false;
+      for(var b=0;b<ch.backups.length;b++){
+        if(srcKey(ch.backups[b].url, ch.backups[b]) === k) return false;
+      }
+      ch.backups.push({ url:url, referer:meta.referer, userAgent:meta.userAgent,
+        origin:meta.origin, drmType:meta.drmType, drmLicenseUrl:meta.drmLicenseUrl,
+        proxyName:meta.proxyName, quality:meta.quality });
+      return true;
+    }
+    function normName(n){ return String(n || '').toLowerCase().replace(/\s+/g,' ').trim(); }
+    function flushOrphan(c){
+      if(c && !c.url && c._bk && c._bk.length){
+        orphans.push({ name:c.name, logo:c.logo, group:c.group, tvgId:c.tvgId, number:c.number, meta:metaOf(c), urls:c._bk, pos:channels.length });
+      }
+    }
+    function pendingIsEmpty(){
+      return !(pendingHeaders.referer || pendingHeaders.userAgent || pendingHeaders.origin ||
+               pendingDrm.type || pendingDrm.licenseUrl || pendingProxyName || pendingQuality);
+    }
+    function handleBackupUrl(url){
+      if(current){
+        // EXTINF sudah ada tapi belum ketemu URL aktif -> tampung dulu.
+        (current._bk = current._bk || []).push(url);
+      } else if(lastChannel && pendingIsEmpty()){
+        // tepat sesudah URL aktif & belum ada header/DRM baru yang menunggu.
+        addBackupTo(lastChannel, url, metaOf(lastChannel));
+      }
+      // selain itu: sisa blok tanpa EXTINF -> abaikan.
+    }
+
     for(var i=0;i<lines.length;i++){
       var line = lines[i].trim();
       if(!line) continue;
@@ -1020,8 +1081,18 @@
         line = '#' + line;
       }
       if(line.charAt(0) === '#'){
+        var bm = line.match(backupRe);
+        if(bm){ handleBackupUrl(bm[1].trim()); continue; }
+        // "##EXTINF..." / "##KODIPROP..." dsb = awal blok channel yang
+        // SELURUHNYA dinonaktifkan. URL "##http" sesudahnya milik blok itu,
+        // BUKAN cadangan channel aktif sebelumnya -> putus keterkaitan.
+        if(/^#{2,}\s*(EXTINF|KODIPROP|EXTVLCOPT|EXTHTTP|EXTPROXY)/i.test(line)){
+          lastChannel = null;
+          continue;
+        }
         var upper = line.toUpperCase();
         if(upper.indexOf('#EXTINF') === 0){
+          flushOrphan(current);
           var attrs = {};
           var m;
           attrRegex.lastIndex = 0;
@@ -1100,11 +1171,62 @@
       if(pendingProxyName) current.proxyName = pendingProxyName;
       if(pendingQuality) current.quality = pendingQuality;
       channels.push(current);
+      if(current._bk){
+        var mt0 = metaOf(current);
+        current._bk.forEach(function(u){ addBackupTo(current, u, mt0); });
+        delete current._bk;
+      }
+      lastChannel = current;
       current = null;
       pendingHeaders = {};
       pendingDrm = {};
       pendingProxyName = '';
       pendingQuality = '';
+    }
+    flushOrphan(current);
+    var attached = 0, skipped = 0, promoted = 0, standalone = [];
+    orphans.forEach(function(o){
+      var key = normName(o.name), best = -1, bestD = 1e9;
+      for(var j=0;j<channels.length;j++){
+        if(normName(channels[j].name) !== key) continue;
+        var d = j >= o.pos ? (j - o.pos) : (o.pos - 1 - j);
+        if(d < bestD || (d === bestD && j >= o.pos)){ bestD = d; best = j; }
+      }
+      if(best < 0){ standalone.push(o); return; }
+      o.urls.forEach(function(u){ if(addBackupTo(channels[best], u, o.meta)) attached++; });
+    });
+    // Blok nonaktif TANPA pasangan nama -> dimasukkan sebagai channel sendiri
+    // (nama boleh kembar). URL pertama jadi URL utama, sisanya jadi cadangan.
+    // Kalau sumbernya persis sama dengan channel yang sudah ada, dilewati
+    // supaya tidak dobel. Disisipkan di posisi asalnya agar urutan tetap.
+    var usedSrc = {};
+    channels.forEach(function(c){
+      usedSrc[srcKey(c.url, metaOf(c))] = true;
+      (c.backups || []).forEach(function(b){ usedSrc[srcKey(b.url, b)] = true; });
+    });
+    var inserts = [];
+    standalone.forEach(function(o){
+      var urls = o.urls.filter(function(u){
+        var k = srcKey(u, o.meta);
+        if(usedSrc[k]) return false;
+        usedSrc[k] = true;
+        return true;
+      });
+      if(!urls.length){ skipped++; return; }
+      var nc = { name:o.name || 'Tanpa Nama', logo:o.logo || '', group:o.group || '',
+                 tvgId:o.tvgId || '', number:o.number, url:urls[0] };
+      ['referer','userAgent','origin','drmType','drmLicenseUrl','proxyName','quality'].forEach(function(k){
+        if(o.meta[k]) nc[k] = o.meta[k];
+      });
+      urls.slice(1).forEach(function(u){ addBackupTo(nc, u, o.meta); });
+      inserts.push({ pos:o.pos, ch:nc });
+      promoted++;
+    });
+    for(var q=inserts.length-1;q>=0;q--) channels.splice(inserts[q].pos, 0, inserts[q].ch);
+    var totalBackups = 0;
+    channels.forEach(function(c){ if(c.backups) totalBackups += c.backups.length; });
+    if(totalBackups || skipped){
+      try{ console.log('[Playlist] sumber cadangan terpasang: ' + totalBackups + ' (dari blok nonaktif bernama sama: ' + attached + '), blok nonaktif tanpa pasangan nama dijadikan channel sendiri: ' + promoted + ', dilewati (sumber duplikat): ' + skipped); }catch(e){}
     }
     return { channels: assignNumbers(channels), epgUrls: epgUrls };
   }
@@ -2989,23 +3111,45 @@
     }
     stopYoutube();
 
-    var ext = getExt(ch.url);
-    var proxyBase = getProxyBase(ch);
-    // Kalau proxy sudah dikonfigurasi, SEMUA channel lewat proxy itu — bukan
-    // hanya yang menyatakan butuh header khusus. Banyak server IPTV memblokir
-    // akses browser (CORS) meski tidak menuntut Referer/User-Agent tertentu,
-    // jadi cara paling andal (persis seperti aplikasi IPTV berbasis proxy
-    // lainnya) adalah selalu menitipkan permintaan lewat proxy begitu tersedia.
-    var playUrl = proxyBase ? buildProxiedUrl(ch, proxyBase) : ch.url;
-
     stopIcyMetadata();
-    if(isRadioChannel(ch)) startIcyMetadata(ch, token, playUrl);
 
-    setupPlayer(playUrl, ext, token, ch, function(){
-      if(isStale(token)) return;
-      finalPlaybackError();
-      scheduleAutoRetry(idx, token);
+    // Daftar sumber: URL utama dulu, lalu URL cadangan (kalau ada di playlist
+    // sebagai baris "##http..." / "###http..."). Tiap cadangan memakai
+    // header/DRM-nya sendiri; identitas channel (nama, logo, grup) tetap sama.
+    var sources = [ch];
+    (ch.backups || []).forEach(function(b){
+      sources.push({
+        name: ch.name, logo: ch.logo, group: ch.group, tvgId: ch.tvgId, number: ch.number,
+        url: b.url, referer: b.referer, userAgent: b.userAgent, origin: b.origin,
+        drmType: b.drmType, drmLicenseUrl: b.drmLicenseUrl,
+        proxyName: b.proxyName, quality: b.quality || ch.quality
+      });
     });
+
+    function playSource(k){
+      var src = sources[k];
+      var ext = getExt(src.url);
+      var proxyBase = getProxyBase(src);
+      // Kalau proxy sudah dikonfigurasi, SEMUA channel lewat proxy itu (banyak
+      // server IPTV memblokir akses browser/CORS meski tidak menuntut header
+      // khusus), jadi permintaan selalu dititipkan lewat proxy begitu tersedia.
+      var playUrl = proxyBase ? buildProxiedUrl(src, proxyBase) : src.url;
+
+      if(k === 0 && isRadioChannel(ch)) startIcyMetadata(ch, token, playUrl);
+
+      setupPlayer(playUrl, ext, token, src, function(){
+        if(isStale(token)) return;
+        if(k + 1 < sources.length){
+          try{ console.log('[Sumber] gagal (' + (k+1) + '/' + sources.length + '), mencoba cadangan berikutnya'); }catch(e){}
+          toast('Sumber ' + (k+1) + ' gagal, mencoba cadangan ' + (k+2) + '/' + sources.length, { duration: 2500 });
+          playSource(k + 1);
+          return;
+        }
+        finalPlaybackError();
+        scheduleAutoRetry(idx, token);
+      });
+    }
+    playSource(0);
   }
 
   function nextChannel(){
