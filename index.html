@@ -2457,8 +2457,47 @@
               });
             }
           }catch(e){ finalMap = ckMap; }
-          var clearProt = { 'org.w3.clearkey': { clearkeys: finalMap } };
+          // priority 0 = dipilih paling awal; sistem DRM lain (Widevine/PlayReady)
+          // diberi prioritas rendah supaya tidak dipilih dash.js.
+          var clearProt = { 'org.w3.clearkey': { clearkeys: finalMap, priority: 0 } };
+          clearProt['com.widevine.alpha'] = { priority: 8 };
+          clearProt['com.microsoft.playready'] = { priority: 9 };
           player.setProtectionData(clearProt);
+          // JAMINAN: banyak manifest multi-DRM memuat ContentProtection untuk
+          // Widevine + PlayReady + ClearKey. dash.js bisa memilih Widevine/
+          // PlayReady (tanpa server lisensi -> "No license server URL
+          // specified"). Jadi manifest ditulis ulang sebelum diproses: buang
+          // Widevine/PlayReady, dan sisakan/tambahkan ClearKey.
+          try{
+            if(typeof player.addResponseInterceptor === 'function'){
+              player.addResponseInterceptor(function(resp){
+                try{
+                  if(resp && resp.request && resp.request.type === 'MPD'){
+                    var txt = resp.data;
+                    if(txt && typeof txt !== 'string' && txt.byteLength !== undefined){
+                      try{ txt = new TextDecoder('utf-8').decode(txt); }catch(e2){ txt = null; }
+                    }
+                    if(typeof txt === 'string' && txt.indexOf('ContentProtection') !== -1){
+                      var CK = 'e2719d58-a985-b3c9-781a-b030af78d30e';
+                      var CK2 = '1077efec-c0b2-4d02-ace3-3c1e52e2fb4b';
+                      var re = /<ContentProtection\b[^>]*?\/>|<ContentProtection\b[^>]*>[\s\S]*?<\/ContentProtection>/gi;
+                      var hasCk = txt.toLowerCase().indexOf(CK) !== -1 || txt.toLowerCase().indexOf(CK2) !== -1;
+                      txt = txt.replace(re, function(m){
+                        var l = m.toLowerCase();
+                        if(l.indexOf('mp4protection') !== -1){
+                          return hasCk ? m : m + '<ContentProtection schemeIdUri="urn:uuid:' + CK + '" value="ClearKey1.0"/>';
+                        }
+                        if(l.indexOf(CK) !== -1 || l.indexOf(CK2) !== -1) return m;
+                        return ''; // Widevine, PlayReady, dll dibuang
+                      });
+                      resp.data = txt;
+                    }
+                  }
+                }catch(e3){ /* biarkan manifest asli */ }
+                return Promise.resolve(resp);
+              });
+            }
+          }catch(e4){}
           try{ console.info('[DRM] ClearKey lokal aktif, jumlah kunci:', count, Object.keys(ckMap)); }catch(e){}
         } else {
           try{ console.warn('[DRM] license_key clearkey tidak valid (harus KID:KEY heksadesimal 32 karakter):', ch.drmLicenseUrl); }catch(e){}
