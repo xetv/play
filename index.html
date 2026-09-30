@@ -1594,44 +1594,27 @@
     });
     if(!any) return; // playlist tidak punya tvg-id sama sekali, EPG tidak akan pernah cocok
 
-    // PERBAIKAN: playlist sering mencantumkan BANYAK url-tvg sekaligus
-    // (dipisah koma) karena tiap sumber biasanya cuma meng-cover sebagian
-    // channel -- satu sumber fokus channel nasional, sumber lain fokus
-    // channel internasional/niche, dst. Sebelumnya kode ini BERHENTI di
-    // sumber PERTAMA yang punya minimal 1 programme cocok, jadi kalau
-    // sumber itu kebetulan cuma cover sebagian channel (mis. yang ClearKey),
-    // sumber-sumber lain yang isinya channel-channel LAIN tidak pernah
-    // dicoba -- makanya sebagian channel "tidak kedapatan EPG" padahal EPG
-    // sumbernya sebenarnya ada, cuma belum sempat dibaca. Sekarang SEMUA
-    // sumber (maks 4) dicoba & DIGABUNG; kalau ada tvg-id yang muncul di
-    // lebih dari satu sumber, sumber yang lebih dulu berhasil yang menang
-    // (tidak ditimpa sumber belakangan) supaya hasilnya stabil/konsisten.
     var sources = epgUrls.slice(0, 4); // batasi maksimal 4 percobaan, tetap ringan
-    var merged = {};
     var i = 0;
-    function refreshIfShown(){
-      var ch = state.channels[state.currentIndex];
-      if(ch && els.osd.classList.contains('show')) refreshOsdEpg(ch);
-    }
-    function next(){
+    function tryNext(){
       if(i >= sources.length || myToken !== state.epgToken) return;
       var url = sources[i++];
       fetchEpgText(url).then(function(text){
         if(myToken !== state.epgToken) return;
         var result = parseXmltvProgrammes(text, wantedTvgIds);
         if(result.count > 0){
-          Object.keys(result.index).forEach(function(k){
-            if(!merged[k]) merged[k] = result.index[k]; // sumber pertama yang punya id ini menang
-          });
-          state.epgIndex = merged;
-          refreshIfShown(); // langsung tampil progresif, tidak tunggu semua sumber selesai
+          state.epgIndex = result.index;
+          // Kalau OSD sedang tampil, refresh supaya info EPG langsung muncul.
+          var ch = state.channels[state.currentIndex];
+          if(ch && els.osd.classList.contains('show')) refreshOsdEpg(ch);
+        } else {
+          tryNext(); // tidak ada programme yang cocok, coba sumber berikutnya
         }
-        next(); // TETAP lanjut ke sumber berikutnya, bukan cuma kalau count = 0
       }).catch(function(){
-        next(); // sumber ini gagal (CORS/network/dll), coba sumber berikutnya
+        tryNext(); // sumber ini gagal (CORS/network/dll), coba sumber berikutnya
       });
     }
-    next();
+    tryNext();
   }
 
   function getNowPlaying(tvgId){
@@ -2181,58 +2164,8 @@
     els.video.addEventListener('error', onErr, {once:true});
   }
 
-  // ClearKey untuk stream HLS (.m3u8) -- BEDA dari jalur DASH (tryDash) yang
-  // sudah pakai dash.js.setProtectionData bawaan. hls.js TIDAK punya mode
-  // "clearkey lokal tanpa server" seperti dash.js, jadi di sini kita pasang
-  // EME (Encrypted Media Extensions) manual langsung ke elemen <video>,
-  // TERLEPAS dari hls.js -- begitu browser menemukan init segment terenkripsi
-  // di fragmen fMP4, event 'encrypted' otomatis terpicu di video, lalu kita
-  // bikinkan sesi CDM ClearKey dan balas 'message'-nya dengan kunci yang
-  // sudah kita punya SENDIRI (dari playlist) -- TIDAK ADA request jaringan
-  // sama sekali untuk lisensinya (beda dari Widevine yang wajib ke server
-  // sungguhan). Proxy (Cloudflare Worker/Deno) di alur ini kalau dipakai
-  // cuma untuk CORS manifest/segmen, sama sekali tidak terlibat di DRM-nya.
-  function wireClearKeyEmeForHls(ch, token){
-    if(!ch || !ch.drmType || String(ch.drmType).toLowerCase().indexOf('clearkey') === -1) return;
-    if(!ch.drmLicenseUrl || /^https?:\/\//i.test(ch.drmLicenseUrl)) return; // itu URL server sungguhan, bukan KID:KEY -- di luar cakupan "tanpa server"
-    if(!(navigator.requestMediaKeySystemAccess)) return; // browser tidak dukung EME sama sekali
-    var kidKey = ch.drmLicenseUrl.split(':');
-    if(kidKey.length !== 2) return;
-    var kidB64 = hexToBase64Url(kidKey[0].trim());
-    var keyB64 = hexToBase64Url(kidKey[1].trim());
-    if(!kidB64 || !keyB64) return;
-
-    function onEncrypted(e){
-      if(isStale(token)) return;
-      navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{
-        initDataTypes: ['cenc', 'keyids'],
-        videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.42E01E"' }],
-        audioCapabilities: [{ contentType: 'audio/mp4; codecs="mp4a.40.2"' }]
-      }]).then(function(access){
-        return access.createMediaKeys();
-      }).then(function(mediaKeys){
-        if(isStale(token)) return Promise.reject('stale');
-        return els.video.setMediaKeys(mediaKeys).then(function(){ return mediaKeys; });
-      }).then(function(mediaKeys){
-        if(isStale(token)) return;
-        var session = mediaKeys.createSession();
-        session.addEventListener('message', function(){
-          // Balas SENDIRI, lokal, tanpa fetch/XHR ke mana pun -- persis
-          // format JSON Web Key Set yang diminta spesifikasi ClearKey.
-          var jwk = JSON.stringify({ keys: [{ kty: 'oct', k: keyB64, kid: kidB64 }], type: 'temporary' });
-          session.update(new TextEncoder().encode(jwk)).catch(function(){});
-        });
-        session.generateRequest(e.initDataType, e.initData).catch(function(){});
-      }).catch(function(){ /* CDM ClearKey tidak tersedia di browser ini -- biarkan gagal seperti biasa */ });
-    }
-    // {once:true}: video ganti channel = elemen dipakai ulang, listener lama
-    // harus tidak nyangkut ke sesi channel berikutnya.
-    els.video.addEventListener('encrypted', onEncrypted, { once: true });
-  }
-
   function tryHls(url, token, ch, onFail){
     if(isStale(token)) return;
-    wireClearKeyEmeForHls(ch, token);
     if(!(window.Hls && Hls.isSupported())){
       // Safari & beberapa browser TV punya dukungan HLS native lewat <video> langsung.
       if(els.video.canPlayType('application/vnd.apple.mpegurl')){
@@ -2480,38 +2413,64 @@
       // sumber error "DRM: No license server url specified" di console.
       // Cek sekarang pakai .indexOf('clearkey') supaya kedua penulisan
       // ("clearkey" maupun "org.w3.clearkey") sama-sama terdeteksi.
-      if(ch && ch.drmType && String(ch.drmType).toLowerCase().indexOf('clearkey') !== -1 && ch.drmLicenseUrl && !/^https?:\/\//i.test(ch.drmLicenseUrl)){
-        // Format "KID:KEY" heksadesimal langsung (BUKAN URL) — didekripsi
-        // LOKAL oleh dash.js, tanpa perlu menghubungi server mana pun.
+      var drmTypeNorm = (ch && ch.drmType) ? String(ch.drmType).trim().toLowerCase() : '';
+      var isClearKey = drmTypeNorm.indexOf('clearkey') !== -1;
+      // Nama key-system yang DIKENAL dash.js harus persis "org.w3.clearkey".
+      // Playlist sering menulis "clearkey" polos -> kalau dipakai apa adanya
+      // sebagai kunci protectionData, dash.js tidak mengenalinya.
+      if(isClearKey && ch.drmLicenseUrl && !/^https?:\/\//i.test(ch.drmLicenseUrl)){
+        // Format "KID:KEY" heksadesimal (boleh banyak pasangan dipisah koma)
+        // — didekripsi LOKAL oleh dash.js, tanpa server lisensi.
         //
-        // BUG YANG DIPERBAIKI: dash.js men-generate respons lisensi
-        // clearkey secara lokal dari peta `clearkeys`, TAPI ia meminta
-        // KID & KEY dalam format base64url — bukan hex mentah seperti
-        // yang tertulis di playlist. Kalau diserahkan sebagai hex mentah
-        // (seperti sebelumnya), dash.js gagal mengenalinya sebagai kunci
-        // valid, lalu diam-diam beralih mencoba mengirim permintaan
-        // lisensi SUNGGUHAN lewat jaringan (padahal tidak ada server yang
-        // dituju) — persis sumber pesan "DRM: No license url specified"
-        // / "error sending update message" yang muncul di console.
-        var kidKey = ch.drmLicenseUrl.split(':');
-        if(kidKey.length === 2){
-          var kidB64 = hexToBase64Url(kidKey[0].trim());
-          var keyB64 = hexToBase64Url(kidKey[1].trim());
+        // PERBAIKAN: kalau KID yang diminta manifest/CDM tidak persis ada di
+        // peta `clearkeys`, dash.js diam-diam menelan error-nya lalu
+        // menganggap butuh server lisensi -> muncul "DRM: No license server
+        // URL specified!". Penyebab umum: manifest punya KID lain untuk
+        // audio, atau format KID beda. Solusinya: peta dibuat "toleran" —
+        // KID yang tidak dikenal dijawab dengan kunci yang tersedia
+        // (kunci pertama), sehingga tidak jatuh ke jalur server lisensi.
+        var pairs = ch.drmLicenseUrl.split(',');
+        var ckMap = {}, firstKey = null, count = 0;
+        pairs.forEach(function(pr){
+          var kk = pr.split(':');
+          if(kk.length !== 2) return;
+          var kidB64 = hexToBase64Url(kk[0].trim());
+          var keyB64 = hexToBase64Url(kk[1].trim());
           if(kidB64 && keyB64){
-            var clearProt = { 'org.w3.clearkey': { clearkeys: {} } };
-            clearProt['org.w3.clearkey'].clearkeys[kidB64] = keyB64;
-            player.setProtectionData(clearProt);
+            ckMap[kidB64] = keyB64;
+            if(!firstKey) firstKey = keyB64;
+            count++;
           }
+        });
+        if(count > 0){
+          var finalMap = ckMap;
+          try{
+            if(typeof Proxy === 'function'){
+              finalMap = new Proxy(ckMap, {
+                get: function(t, prop){
+                  if(prop === 'hasOwnProperty') return function(k){ return true; };
+                  if(typeof prop === 'string' && prop in t) return t[prop];
+                  if(typeof prop === 'string' && prop !== 'toJSON' && prop !== 'then') return firstKey;
+                  return t[prop];
+                },
+                has: function(){ return true; }
+              });
+            }
+          }catch(e){ finalMap = ckMap; }
+          var clearProt = { 'org.w3.clearkey': { clearkeys: finalMap } };
+          player.setProtectionData(clearProt);
+          try{ console.info('[DRM] ClearKey lokal aktif, jumlah kunci:', count, Object.keys(ckMap)); }catch(e){}
+        } else {
+          try{ console.warn('[DRM] license_key clearkey tidak valid (harus KID:KEY heksadesimal 32 karakter):', ch.drmLicenseUrl); }catch(e){}
         }
       } else if(ch && ch.drmLicenseUrl){
-        // Widevine (URL server sungguhan), ATAU clearkey varian lain yang
-        // license_key-nya berupa URL (mis. "https://.../?keyid=..&key=..")
-        // — beberapa playlist memakai server clearkey publik yang memang
-        // dirancang menjawab permintaan lisensi standar EME. Keduanya
-        // sama-sama perlu dihubungi lewat jaringan (lewat proxy).
+        // Widevine (URL server sungguhan), ATAU clearkey yang license_key-nya
+        // berupa URL — keduanya perlu dihubungi lewat jaringan (via proxy).
         var licenseUrl = proxyBase ? buildProxiedUrlFor(ch.drmLicenseUrl, ch, proxyBase) : ch.drmLicenseUrl;
         var protData = {};
-        protData[ch.drmType || 'com.widevine.alpha'] = { serverURL: licenseUrl };
+        // Normalisasi nama key-system ke nama standar yang dikenal dash.js.
+        var ksName = isClearKey ? 'org.w3.clearkey' : (ch.drmType ? String(ch.drmType).trim() : 'com.widevine.alpha');
+        protData[ksName] = { serverURL: licenseUrl };
         player.setProtectionData(protData);
       }
 
@@ -2541,7 +2500,10 @@
         }, true);
       }
 
-      player.on(dashjs.MediaPlayer.events.ERROR, fail);
+      player.on(dashjs.MediaPlayer.events.ERROR, function(e){
+        try{ console.warn('[DASH] error:', e && e.error ? (e.error.message || e.error) : e); }catch(_){}
+        fail();
+      });
       player.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, function(){
         applyForcedQualityDash(player, ch);
       });
