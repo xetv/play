@@ -770,6 +770,26 @@
   var CLOUD_API_URL = '';
 
   // ============================================================
+  // WEB TRACKING (opsional) -- catat channel apa yang lagi/sudah ditonton
+  // ============================================================
+  // Kosongkan ('') untuk mematikan tracking sepenuhnya -- tidak ada data
+  // apa pun yang dikirim, perilaku sama seperti sebelum fitur ini ada.
+  //
+  // Isi dengan URL Worker tracking kamu (tanpa slash di akhir), contoh:
+  //   'https://iptv-tracker.username.workers.dev'
+  // (worker-nya ada di file terpisah: tracking-worker.js, deploy sendiri
+  // lewat wrangler -- lihat komentar di file itu dan dashboard.html untuk
+  // lihat hasilnya).
+  //
+  // Begitu diisi, setiap kali pengunjung pindah channel, web ini mengirim
+  // event "mulai nonton" + detak jantung (heartbeat) tiap 15 detik selama
+  // channel itu masih diputar, lalu event "berhenti" saat pindah channel
+  // lain / tab ditutup. Tidak ada data pribadi yang dikirim selain ID
+  // acak per perangkat (tersimpan di localStorage perangkat itu sendiri).
+  var TRACK_API_URL = '';
+
+
+  // ============================================================
   // KUALITAS/RESOLUSI PAKSA (opsional, edit langsung di sini)
   // ============================================================
   // Pilihan: 'auto' (default — hls.js otomatis pilih sesuai kecepatan
@@ -3172,6 +3192,67 @@
     }
   }
 
+  /* ---------------- Web Tracking (opsional) ---------------- */
+  var Tracker = (function(){
+    if(!TRACK_API_URL) return { onChannelStart: function(){} };
+    var BASE = String(TRACK_API_URL).replace(/\/+$/, '');
+    var HEARTBEAT_MS = 15000;
+    var LS_CLIENT = 'iptvTrackClientId';
+    var clientId = (function(){
+      try{
+        var v = localStorage.getItem(LS_CLIENT);
+        if(!v){
+          v = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+              : (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2));
+          localStorage.setItem(LS_CLIENT, v);
+        }
+        return v;
+      }catch(e){ return 'anon'; }
+    })();
+    var sessionId = null;
+    var hbTimer = null;
+
+    function send(action, extra){
+      if(!sessionId && action !== 'start') return;
+      var data = Object.assign({ action: action, sessionId: sessionId }, extra || {});
+      try{
+        var body = JSON.stringify(data);
+        if(navigator.sendBeacon){
+          navigator.sendBeacon(BASE + '/api/track', new Blob([body], { type: 'application/json' }));
+        } else {
+          fetch(BASE + '/api/track', { method:'POST', headers:{'Content-Type':'application/json'}, body: body, keepalive:true })
+            .catch(function(){});
+        }
+      }catch(e){ /* tracking opsional, abaikan error diam-diam */ }
+    }
+
+    function stopCurrent(){
+      if(!sessionId) return;
+      send('stop');
+      if(hbTimer){ clearInterval(hbTimer); hbTimer = null; }
+      sessionId = null;
+    }
+
+    function onChannelStart(ch){
+      stopCurrent();
+      sessionId = clientId + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+      send('start', { clientId: clientId, channel: ch.name || '', group: ch.group || '', number: ch.number || null });
+      hbTimer = setInterval(function(){ send('heartbeat'); }, HEARTBEAT_MS);
+    }
+
+    window.addEventListener('pagehide', stopCurrent);
+    window.addEventListener('beforeunload', stopCurrent);
+    document.addEventListener('visibilitychange', function(){
+      // Tab disembunyikan (ganti tab lain / layar dikunci) bukan berarti
+      // berhenti nonton total (banyak TV/perangkat tetap memutar audio di
+      // latar belakang) -- jadi cukup kirim heartbeat seperti biasa, tidak
+      // ditutup sesinya di sini.
+      if(!document.hidden) send('heartbeat');
+    });
+
+    return { onChannelStart: onChannelStart };
+  })();
+
   function startPlayback(idx, isAutoRetry){
     var ch = state.channels[idx];
     if(!ch) return;
@@ -3181,6 +3262,7 @@
       // backoff dari awal lagi untuk channel baru ini.
       if(state.retryTimer){ clearTimeout(state.retryTimer); state.retryTimer = null; }
       state.retryDelay = 0;
+      Tracker.onChannelStart(ch);
     }
     state.currentIndex = idx;
     try{ localStorage.setItem(LS_LAST, String(ch.number)); }catch(e){}
